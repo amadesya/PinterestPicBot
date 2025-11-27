@@ -3,8 +3,7 @@ from aiogram import Bot, Dispatcher, Router, types
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 from playwright.async_api import async_playwright
-
-TOKEN = "8519549158:AAFxmALtJAr72IZokbzYG4y7p2nf838HTPI"
+from env import TOKEN
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
