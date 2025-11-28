@@ -5,6 +5,7 @@ from aiogram.filters import Command
 from playwright.async_api import async_playwright
 import os
 
+TOKEN = os.environ.get("TOKEN")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
