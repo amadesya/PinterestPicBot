@@ -78,6 +78,10 @@ async def send_images(user_id: int, call: CallbackQuery = None):
     if user_id not in user_logs:
         user_logs[user_id] = []
 
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Показать ещё", callback_data="next")]]
+    )
+
     for img in next_images:
         try:
             await bot.send_photo(user_id, img, caption=f"🔗 {img}")
@@ -86,23 +90,11 @@ async def send_images(user_id: int, call: CallbackQuery = None):
             logging.error(f"Ошибка отправки фото: {img}\n{e}")
             await bot.send_message(user_id, f"❌ Не удалось загрузить картинку:\n{img}")
 
+    await bot.send_message(user_id, "Хотите ещё картинки?", reply_markup=keyboard)
+
     state["offset"] += 5
     if state["offset"] >= len(images):
         state["offset"] = 0 
-
-    keyboard = get_keyboard()
-
-    if call:
-        await call.message.edit_text(
-            "Показаны изображения. Листай!",
-            reply_markup=keyboard
-        )
-    else:
-        await bot.send_message(
-            user_id,
-            "Показаны изображения. Листай!",
-            reply_markup=keyboard
-        )
 
 @router.message()
 async def get_images(message: Message):
