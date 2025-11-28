@@ -3,7 +3,7 @@ from aiogram import Bot, Dispatcher, Router, types
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 from playwright.async_api import async_playwright
-from env import TOKEN
+import os
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
