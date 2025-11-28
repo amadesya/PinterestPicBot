@@ -1,5 +1,5 @@
-aiogram==3.4.1
-playwright==1.46.0
+aiogram
+playwright
 bs4
 aiohttp
 asyncio
