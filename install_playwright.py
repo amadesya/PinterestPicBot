@@ -1,6 +1,9 @@
-from playwright.sync_api import sync_playwright
-import subprocess
+from playwright.async_api import async_playwright
+import asyncio
 
-subprocess.run(["playwright", "install"], check=True)
+async def main():
+    async with async_playwright() as p:
+        await p.chromium.launch()
+    print("Playwright browsers installed successfully!")
 
-print("Playwright browsers installed successfully!")
+asyncio.run(main())
