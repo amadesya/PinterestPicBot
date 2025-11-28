@@ -12,7 +12,7 @@ router = Router()
 dp.include_router(router)
 
 user_queries = {}
-user_logs = {} 
+user_logs = {}  # лог показанных картинок
 
 async def search_pinterest(query: str, limit: int = 50):
     async with async_playwright() as p:
@@ -32,6 +32,7 @@ async def search_pinterest(query: str, limit: int = 50):
         )
 
         await browser.close()
+        # теперь лимит не режем, грузим все найденные
         return srcsets
 
 
@@ -58,18 +59,21 @@ async def send_next_images(user_id: int, call: CallbackQuery = None):
 
     state["offset"] += 5
 
+    # Если дошли до конца — начинаем сначала
     if state["offset"] >= len(images):
         state["offset"] = 0
 
-    if state["offset"] < len(images):
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="Показать ещё", callback_data="more")]]
-        )
+    # Кнопка теперь всегда показывается, цикл бесконечный
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Показать ещё", callback_data="more")]]
+    )
 
-        if call:
-            await call.message.edit_text("Показаны ещё изображения. Хочешь ещё?", reply_markup=keyboard)
-        else:
-            await bot.send_message(user_id, "Показаны 5 изображений. Хочешь ещё?", reply_markup=keyboard)
+    if call:
+        await call.message.edit_text("Показаны изображения. Хочешь ещё?", reply_markup=keyboard)
+    else:
+        await bot.send_message(user_id, "Показаны изображения. Хочешь ещё?", reply_markup=keyboard)
+
+    await bot.send_message(user_id, "Показаны 5 изображений. Хочешь ещё?", reply_markup=keyboard)
     else:
         if call:
             await call.message.edit_text("Все изображения показаны. Лог просмотренных сохранён.")
