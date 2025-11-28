@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright, Page
 # ---------------- Конфигурация логов ----------------
 logging.basicConfig(
     filename="bot_errors.log",
-    level=logging.ERROR,
+    level=logging.INFO,  # Изменено на INFO для отладки
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
@@ -78,38 +78,79 @@ async def fetch_images_from_pinterest(query: str, page: Page, already_seen: Set[
     Скроллит несколько раз, собирает ссылки картинок в максимальном разрешении.
     """
     try:
-        await page.goto(f"https://www.pinterest.com/search/pins/?q={query.replace(' ', '%20')}", timeout=60000)
-        await page.wait_for_selector("img[srcset]", timeout=20000)
+        url = f"https://www.pinterest.com/search/pins/?q={query.replace(' ', '%20')}"
+        await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+        
+        # Пробуем разные селекторы и даём больше времени на загрузку
+        selectors = ["img[srcset]", "img[src]", "div[data-test-id='pinWrapper'] img"]
+        img_loaded = False
+        
+        for selector in selectors:
+            try:
+                await page.wait_for_selector(selector, timeout=10000)
+                img_loaded = True
+                break
+            except Exception:
+                continue
+        
+        if not img_loaded:
+            logging.error(f"Не удалось найти изображения на странице для запроса: {query}")
+            # Даём ещё немного времени
+            await asyncio.sleep(3)
+        
     except Exception as e:
         logging.error(f"Ошибка при заходе на страницу Pinterest: {e}")
+        # Не возвращаем сразу, попробуем спарсить что есть
     
     # Скроллим страницу для подгрузки новых картинок
-    for _ in range(SCRROLLS_PER_FETCH):
+    for i in range(SCRROLLS_PER_FETCH):
         try:
-            await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-            await asyncio.sleep(1.5)
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 1.5)")
+            await asyncio.sleep(1.8)
+            
+            # Каждый второй скролл делаем паузу подольше
+            if i % 2 == 1:
+                await asyncio.sleep(0.5)
         except Exception as e:
             logging.error(f"Ошибка при скролле Pinterest: {e}")
 
     # Получаем все img элементы и извлекаем URL в максимальном разрешении
     try:
-        imgs = await page.query_selector_all("img[srcset]")
+        # Пробуем несколько вариантов селекторов
+        imgs = await page.query_selector_all("img[srcset], img[src*='pinimg']")
         results = []
         
         for el in imgs:
             try:
-                # Приоритет: srcset с максимальным разрешением
+                url = None
+                
+                # Приоритет 1: srcset с максимальным разрешением
                 srcset = await el.get_attribute("srcset")
                 if srcset:
                     url = extract_highest_resolution_url(srcset)
-                    if url and url not in already_seen and url.startswith('http'):
-                        # Фильтруем очевидные превью и иконки
-                        if '60x60' not in url and '75x75' not in url and '236x' not in url:
-                            results.append(url)
-                            already_seen.add(url)
-            except Exception:
+                
+                # Приоритет 2: src если это большое изображение
+                if not url:
+                    src = await el.get_attribute("src")
+                    if src and 'pinimg.com' in src and '236x' not in src and '60x' not in src:
+                        url = src
+                
+                if url and url not in already_seen and url.startswith('http'):
+                    # Фильтруем превью и служебные изображения
+                    if all(x not in url for x in ['60x60', '75x75', '236x', 'avatar', 'profile', 'user']):
+                        # Пытаемся получить оригинал, заменяя размеры в URL
+                        if 'pinimg.com' in url:
+                            # Заменяем размеры на originals
+                            url = url.replace('/236x/', '/originals/').replace('/474x/', '/originals/')
+                            url = url.replace('/736x/', '/originals/')
+                        
+                        results.append(url)
+                        already_seen.add(url)
+            except Exception as e:
+                logging.error(f"Ошибка обработки элемента: {e}")
                 continue
         
+        logging.info(f"Найдено {len(results)} новых изображений для запроса '{query}'")
         return results
     except Exception as e:
         logging.error(f"Ошибка при извлечении изображений: {e}")
@@ -138,8 +179,31 @@ async def search_and_enqueue_more(user_id: int):
     
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+            # Запускаем браузер с параметрами для обхода детекции
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox'
+                ]
+            )
+            
+            # Создаём контекст с реальным user agent
+            context = await browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            
+            page = await context.new_page()
+            
+            # Скрываем признаки автоматизации
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
+            
             try:
                 new_imgs = await fetch_images_from_pinterest(query, page, state["shown"])
                 
@@ -155,15 +219,18 @@ async def search_and_enqueue_more(user_id: int):
                 # Если ничего не добавилось — увеличиваем счётчик неудач
                 if appended == 0:
                     state["fetch_attempts"] = state.get("fetch_attempts", 0) + 1
+                    logging.warning(f"Попытка {state['fetch_attempts']}/{MAX_FETCH_ATTEMPTS}: не найдено новых изображений для '{query}'")
                 else:
                     # Сбрасываем счётчик при успехе
                     state["fetch_attempts"] = 0
+                    logging.info(f"Успешно добавлено {appended} изображений для user {user_id}")
                     
             except Exception as e:
                 logging.error(f"Ошибка во время парсинга для user {user_id}: {e}")
                 state["fetch_attempts"] = state.get("fetch_attempts", 0) + 1
             finally:
                 try:
+                    await context.close()
                     await browser.close()
                 except Exception:
                     pass
