@@ -2,7 +2,7 @@
 
 1. Установка библиотек
 ```
-pip install aiogram playwright beautifulsoup4 aiohttp && playwright install
+pip install requirements.txt
 
 playwright install
 ```
