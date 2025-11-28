@@ -74,67 +74,121 @@ def extract_highest_resolution_url(srcset: str) -> str:
 # ---------------- Парсер Pinterest ----------------
 async def fetch_images_from_pinterest(query: str, page: Page, already_seen: Set[str]) -> List[str]:
     """
-    Парсит Pinterest и возвращает список ссылок на оригинальные изображения.
+    Парсит страницу Pinterest с данным query в контексте уже открытой страницы.
+    Скроллит несколько раз, собирает ссылки картинок в максимальном разрешении.
     """
-    results = []
     try:
         url = f"https://www.pinterest.com/search/pins/?q={query.replace(' ', '%20')}"
-        await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-
-        # Маскируем headless
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-        """)
-
-        # Скроллим страницу несколько раз для подгрузки картинок
-        for _ in range(SCRROLLS_PER_FETCH):
-            await page.evaluate("window.scrollBy(0, window.innerHeight);")
-            await asyncio.sleep(1.5)
-
-        # Находим все img, содержащие pinimg (Pinterest)
-        imgs = await page.query_selector_all("img[src*='pinimg.com']")
-        logging.info(f"Найдено {len(imgs)} img элементов на странице")
-
-        for el in imgs:
+        logging.info(f"Переход на URL: {url}")
+        
+        response = await page.goto(url, timeout=60000, wait_until="networkidle")
+        logging.info(f"Статус ответа: {response.status if response else 'None'}")
+        
+        # Ждём загрузки изображений более агрессивно
+        await asyncio.sleep(5)  # Даём время на загрузку JavaScript
+        
+        # Пробуем разные селекторы
+        selectors = [
+            "img[src*='pinimg.com']",
+            "img[srcset]",
+            "div[data-test-id='pin'] img",
+            "div[role='img']",
+            "img"
+        ]
+        
+        img_loaded = False
+        for selector in selectors:
             try:
-                # Получаем srcset или src
-                srcset = await el.get_attribute("srcset")
-                src = await el.get_attribute("src")
-                url_candidate = None
-
-                if srcset:
-                    # Берём URL с наибольшим разрешением
-                    parts = [p.strip() for p in srcset.split(',') if p.strip()]
-                    max_w = 0
-                    for part in parts:
-                        tokens = part.split()
-                        if len(tokens) >= 2:
-                            u, w = tokens[0], int(tokens[1].rstrip('w'))
-                            if w > max_w:
-                                max_w = w
-                                url_candidate = u
-                elif src:
-                    url_candidate = src
-
-                if url_candidate and url_candidate.startswith("http") and url_candidate not in already_seen:
-                    # Фильтруем миниатюры и служебные картинки
-                    if all(x not in url_candidate for x in ["236x", "60x", "avatar", "profile", "user"]):
-                        # Старайся брать оригинал
-                        url_candidate = url_candidate.replace("/236x/", "/originals/").replace("/474x/", "/originals/").replace("/736x/", "/originals/")
-                        results.append(url_candidate)
-                        already_seen.add(url_candidate)
+                elements = await page.query_selector_all(selector)
+                if elements and len(elements) > 0:
+                    logging.info(f"Найдено {len(elements)} элементов по селектору: {selector}")
+                    img_loaded = True
+                    break
             except Exception as e:
-                logging.error(f"Ошибка обработки img элемента: {e}")
+                logging.warning(f"Селектор {selector} не сработал: {e}")
                 continue
-
-        logging.info(f"Возвращено {len(results)} новых изображений для запроса '{query}'")
-        return results
-
+        
+        if not img_loaded:
+            # Сохраняем скриншот и HTML для отладки
+            try:
+                await page.screenshot(path=f"debug_{query[:20]}.png")
+                html = await page.content()
+                logging.error(f"HTML длина: {len(html)}, начало: {html[:500]}")
+            except Exception:
+                pass
+        
     except Exception as e:
-        logging.error(f"Ошибка при fetch_images_from_pinterest: {e}")
+        logging.error(f"Ошибка при заходе на страницу Pinterest: {e}")
+    
+    # Скроллим страницу для подгрузки новых картинок
+    for i in range(SCRROLLS_PER_FETCH):
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logging.error(f"Ошибка при скролле Pinterest: {e}")
+
+    # Получаем все img элементы
+    try:
+        # Получаем ВСЕ изображения на странице
+        all_imgs = await page.query_selector_all("img")
+        logging.info(f"Всего найдено img элементов: {len(all_imgs)}")
+        
+        results = []
+        processed = 0
+        
+        for el in all_imgs:
+            try:
+                url = None
+                processed += 1
+                
+                # Сначала пробуем srcset
+                srcset = await el.get_attribute("srcset")
+                if srcset:
+                    url = extract_highest_resolution_url(srcset)
+                    if url:
+                        logging.info(f"Из srcset: {url[:100]}")
+                
+                # Потом src
+                if not url:
+                    src = await el.get_attribute("src")
+                    if src:
+                        url = src
+                        logging.info(f"Из src: {url[:100]}")
+                
+                # Проверяем что это Pinterest изображение
+                if url and 'pinimg.com' in url:
+                    # Преобразуем в оригинал
+                    original_url = url
+                    
+                    # Удаляем параметры размера
+                    if '/236x/' in original_url:
+                        original_url = original_url.replace('/236x/', '/originals/')
+                    elif '/474x/' in original_url:
+                        original_url = original_url.replace('/474x/', '/originals/')
+                    elif '/736x/' in original_url:
+                        original_url = original_url.replace('/736x/', '/originals/')
+                    
+                    # Проверяем фильтры
+                    if all(x not in original_url.lower() for x in ['avatar', 'profile', 'user', '60x60', '75x75']):
+                        if original_url not in already_seen:
+                            results.append(original_url)
+                            already_seen.add(original_url)
+                            logging.info(f"✓ Добавлено изображение: {original_url[:80]}")
+                
+            except Exception as e:
+                logging.error(f"Ошибка обработки элемента {processed}: {e}")
+                continue
+        
+        logging.info(f"Обработано элементов: {processed}, найдено подходящих: {len(results)}")
+        return results
+        
+    except Exception as e:
+        logging.error(f"Критическая ошибка при извлечении изображений: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
         return []
+
 
 async def search_and_enqueue_more(user_id: int):
     """
@@ -160,11 +214,13 @@ async def search_and_enqueue_more(user_id: int):
         async with async_playwright() as p:
             # Запускаем браузер с параметрами для обхода детекции
             browser = await p.chromium.launch(
-                headless=True,
+                headless=False,  # Временно отключаем headless для отладки
                 args=[
                     '--disable-blink-features=AutomationControlled',
                     '--disable-dev-shm-usage',
-                    '--no-sandbox'
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-web-security'
                 ]
             )
             
