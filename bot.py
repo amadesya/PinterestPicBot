@@ -12,7 +12,7 @@ router = Router()
 dp.include_router(router)
 
 user_queries = {}
-user_logs = {}  # лог показанных картинок
+user_logs = {} 
 
 async def search_pinterest(query: str, limit: int = 50):
     async with async_playwright() as p:
@@ -32,7 +32,7 @@ async def search_pinterest(query: str, limit: int = 50):
         )
 
         await browser.close()
-        return srcsets[:limit]
+        return srcsets
 
 
 @router.message(Command("start"))
@@ -57,6 +57,9 @@ async def send_next_images(user_id: int, call: CallbackQuery = None):
         user_logs[user_id].append(img)
 
     state["offset"] += 5
+
+    if state["offset"] >= len(images):
+        state["offset"] = 0
 
     if state["offset"] < len(images):
         keyboard = InlineKeyboardMarkup(
