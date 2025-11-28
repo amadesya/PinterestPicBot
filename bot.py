@@ -1,18 +1,22 @@
 import asyncio
 import logging
 import os
+import json
 from typing import List, Set
+import aiohttp
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
-from playwright.async_api import async_playwright, Page
 
 # ---------------- Конфигурация логов ----------------
 logging.basicConfig(
-    filename="bot_errors.log",
-    level=logging.INFO,  # Изменено на INFO для отладки
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot_errors.log"),
+        logging.StreamHandler()
+    ]
 )
 
 # ---------------- Инициализация Telegram ----------------
@@ -29,10 +33,9 @@ dp.include_router(router)
 user_state = {}
 
 # Параметры работы
-BLOCK_SIZE = 5           # сколько картинок отправляем за раз
-SCRROLLS_PER_FETCH = 5   # сколько раз скроллить при каждом доп.запросе
-MIN_QUEUE_THRESHOLD = 8  # когда в очереди меньше этого числа — подгружать ещё
-MAX_FETCH_ATTEMPTS = 3   # максимум попыток fetch до остановки
+BLOCK_SIZE = 5
+MIN_QUEUE_THRESHOLD = 8
+MAX_FETCH_ATTEMPTS = 3
 
 
 # ---------------- Вспомогательные клавиатуры ----------------
@@ -42,167 +45,112 @@ def get_more_keyboard():
     )
 
 
-def extract_highest_resolution_url(srcset: str) -> str:
+# ---------------- Парсер Pinterest через API ----------------
+async def fetch_images_from_pinterest_api(query: str, already_seen: Set[str], bookmark: str = None) -> tuple[List[str], str]:
     """
-    Извлекает URL с максимальным разрешением из srcset.
-    srcset формат: "url1 100w, url2 200w, url3 500w"
-    """
-    try:
-        parts = [p.strip() for p in srcset.split(',') if p.strip()]
-        # Каждая часть: "url width"
-        max_width = 0
-        best_url = None
-        
-        for part in parts:
-            tokens = part.split()
-            if len(tokens) >= 2:
-                url = tokens[0]
-                width_str = tokens[1].rstrip('w')
-                try:
-                    width = int(width_str)
-                    if width > max_width:
-                        max_width = width
-                        best_url = url
-                except ValueError:
-                    continue
-        
-        return best_url if best_url else parts[-1].split()[0]
-    except Exception:
-        return None
-
-
-# ---------------- Парсер Pinterest ----------------
-async def fetch_images_from_pinterest(query: str, page: Page, already_seen: Set[str]) -> List[str]:
-    """
-    Парсит страницу Pinterest с данным query в контексте уже открытой страницы.
-    Скроллит несколько раз, собирает ссылки картинок в максимальном разрешении.
+    Использует внутреннее API Pinterest для получения изображений.
+    Возвращает (список URL, bookmark для следующей страницы)
     """
     try:
-        url = f"https://www.pinterest.com/search/pins/?q={query.replace(' ', '%20')}"
-        logging.info(f"Переход на URL: {url}")
+        # Pinterest использует GraphQL API
+        url = "https://www.pinterest.com/resource/BaseSearchResource/get/"
         
-        response = await page.goto(url, timeout=60000, wait_until="networkidle")
-        logging.info(f"Статус ответа: {response.status if response else 'None'}")
+        # Параметры запроса
+        options = {
+            "query": query,
+            "scope": "pins",
+            "page_size": 25
+        }
         
-        # Ждём загрузки изображений более агрессивно
-        await asyncio.sleep(5)  # Даём время на загрузку JavaScript
+        if bookmark:
+            options["bookmarks"] = [bookmark]
         
-        # Пробуем разные селекторы
-        selectors = [
-            "img[src*='pinimg.com']",
-            "img[srcset]",
-            "div[data-test-id='pin'] img",
-            "div[role='img']",
-            "img"
-        ]
+        params = {
+            "source_url": f"/search/pins/?q={query}",
+            "data": json.dumps({
+                "options": options,
+                "context": {}
+            })
+        }
         
-        img_loaded = False
-        for selector in selectors:
-            try:
-                elements = await page.query_selector_all(selector)
-                if elements and len(elements) > 0:
-                    logging.info(f"Найдено {len(elements)} элементов по селектору: {selector}")
-                    img_loaded = True
-                    break
-            except Exception as e:
-                logging.warning(f"Селектор {selector} не сработал: {e}")
-                continue
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest"
+        }
         
-        if not img_loaded:
-            # Сохраняем скриншот и HTML для отладки
-            try:
-                await page.screenshot(path=f"debug_{query[:20]}.png")
-                html = await page.content()
-                logging.error(f"HTML длина: {len(html)}, начало: {html[:500]}")
-            except Exception:
-                pass
-        
-    except Exception as e:
-        logging.error(f"Ошибка при заходе на страницу Pinterest: {e}")
-    
-    # Скроллим страницу для подгрузки новых картинок
-    for i in range(SCRROLLS_PER_FETCH):
-        try:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(2)
-        except Exception as e:
-            logging.error(f"Ошибка при скролле Pinterest: {e}")
-
-    # Получаем все img элементы
-    try:
-        # Получаем ВСЕ изображения на странице
-        all_imgs = await page.query_selector_all("img")
-        logging.info(f"Всего найдено img элементов: {len(all_imgs)}")
-        
-        results = []
-        processed = 0
-        
-        for el in all_imgs:
-            try:
-                url = None
-                processed += 1
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=30) as response:
+                if response.status != 200:
+                    logging.error(f"Pinterest API вернул статус {response.status}")
+                    return [], None
                 
-                # Сначала пробуем srcset
-                srcset = await el.get_attribute("srcset")
-                if srcset:
-                    url = extract_highest_resolution_url(srcset)
-                    if url:
-                        logging.info(f"Из srcset: {url[:100]}")
+                data = await response.json()
                 
-                # Потом src
-                if not url:
-                    src = await el.get_attribute("src")
-                    if src:
-                        url = src
-                        logging.info(f"Из src: {url[:100]}")
+                # Извлекаем результаты
+                results = []
+                next_bookmark = None
                 
-                # Проверяем что это Pinterest изображение
-                if url and 'pinimg.com' in url:
-                    # Преобразуем в оригинал
-                    original_url = url
+                if "resource_response" in data:
+                    resource = data["resource_response"]
                     
-                    # Удаляем параметры размера
-                    if '/236x/' in original_url:
-                        original_url = original_url.replace('/236x/', '/originals/')
-                    elif '/474x/' in original_url:
-                        original_url = original_url.replace('/474x/', '/originals/')
-                    elif '/736x/' in original_url:
-                        original_url = original_url.replace('/736x/', '/originals/')
+                    # Получаем bookmark для следующей страницы
+                    if "bookmark" in resource.get("data", {}):
+                        next_bookmark = resource["data"]["bookmark"]
                     
-                    # Проверяем фильтры
-                    if all(x not in original_url.lower() for x in ['avatar', 'profile', 'user', '60x60', '75x75']):
-                        if original_url not in already_seen:
-                            results.append(original_url)
-                            already_seen.add(original_url)
-                            logging.info(f"✓ Добавлено изображение: {original_url[:80]}")
+                    # Извлекаем пины
+                    pins = resource.get("data", {}).get("results", [])
+                    
+                    logging.info(f"Получено {len(pins)} пинов от API")
+                    
+                    for pin in pins:
+                        try:
+                            # Получаем изображение в максимальном качестве
+                            images = pin.get("images", {})
+                            
+                            # Приоритет: orig > originals > 736x > 474x
+                            img_url = None
+                            if "orig" in images:
+                                img_url = images["orig"].get("url")
+                            elif "originals" in images:
+                                img_url = images["originals"].get("url")
+                            elif "736x" in images:
+                                img_url = images["736x"].get("url")
+                            elif "474x" in images:
+                                img_url = images["474x"].get("url")
+                            
+                            if img_url and img_url not in already_seen:
+                                results.append(img_url)
+                                already_seen.add(img_url)
+                                logging.info(f"✓ Добавлено: {img_url[:80]}")
+                        
+                        except Exception as e:
+                            logging.error(f"Ошибка обработки пина: {e}")
+                            continue
                 
-            except Exception as e:
-                logging.error(f"Ошибка обработки элемента {processed}: {e}")
-                continue
-        
-        logging.info(f"Обработано элементов: {processed}, найдено подходящих: {len(results)}")
-        return results
-        
+                return results, next_bookmark
+                
+    except asyncio.TimeoutError:
+        logging.error("Таймаут запроса к Pinterest API")
+        return [], None
     except Exception as e:
-        logging.error(f"Критическая ошибка при извлечении изображений: {e}")
+        logging.error(f"Ошибка при запросе к Pinterest API: {e}")
         import traceback
         logging.error(traceback.format_exc())
-        return []
+        return [], None
 
 
 async def search_and_enqueue_more(user_id: int):
     """
-    Открывает браузер, парсит Pinterest и добавляет новые ссылки в очередь пользователя.
+    Получает изображения через API Pinterest и добавляет их в очередь.
     """
     state = user_state.get(user_id)
     if not state:
         return
 
-    # Если уже идёт загрузка — не делаем второй запрос
     if state.get("is_fetching"):
         return
 
-    # Проверяем количество неудачных попыток
     if state.get("fetch_attempts", 0) >= MAX_FETCH_ATTEMPTS:
         state["fetch_exhausted"] = True
         return
@@ -211,66 +159,36 @@ async def search_and_enqueue_more(user_id: int):
     query = state["query"]
     
     try:
-        async with async_playwright() as p:
-            # Запускаем браузер с параметрами для обхода детекции
-            browser = await p.chromium.launch(
-                headless=False,  # Временно отключаем headless для отладки
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage',
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-web-security'
-                ]
-            )
+        # Используем bookmark для пагинации
+        bookmark = state.get("next_bookmark")
+        
+        new_imgs, next_bookmark = await fetch_images_from_pinterest_api(
+            query, 
+            state["shown"],
+            bookmark
+        )
+        
+        # Сохраняем bookmark для следующего запроса
+        state["next_bookmark"] = next_bookmark
+        
+        queued_set = set(state["queue"])
+        appended = 0
+        
+        for img in new_imgs:
+            if img not in queued_set:
+                state["queue"].append(img)
+                queued_set.add(img)
+                appended += 1
+        
+        if appended == 0:
+            state["fetch_attempts"] = state.get("fetch_attempts", 0) + 1
+            logging.warning(f"Попытка {state['fetch_attempts']}/{MAX_FETCH_ATTEMPTS}: не найдено новых изображений")
+        else:
+            state["fetch_attempts"] = 0
+            logging.info(f"Успешно добавлено {appended} изображений для user {user_id}")
             
-            # Создаём контекст с реальным user agent
-            context = await browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
-            
-            page = await context.new_page()
-            
-            # Скрываем признаки автоматизации
-            await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-            """)
-            
-            try:
-                new_imgs = await fetch_images_from_pinterest(query, page, state["shown"])
-                
-                queued_set = set(state["queue"])
-                appended = 0
-                
-                for img in new_imgs:
-                    if img not in queued_set:
-                        state["queue"].append(img)
-                        queued_set.add(img)
-                        appended += 1
-                
-                # Если ничего не добавилось — увеличиваем счётчик неудач
-                if appended == 0:
-                    state["fetch_attempts"] = state.get("fetch_attempts", 0) + 1
-                    logging.warning(f"Попытка {state['fetch_attempts']}/{MAX_FETCH_ATTEMPTS}: не найдено новых изображений для '{query}'")
-                else:
-                    # Сбрасываем счётчик при успехе
-                    state["fetch_attempts"] = 0
-                    logging.info(f"Успешно добавлено {appended} изображений для user {user_id}")
-                    
-            except Exception as e:
-                logging.error(f"Ошибка во время парсинга для user {user_id}: {e}")
-                state["fetch_attempts"] = state.get("fetch_attempts", 0) + 1
-            finally:
-                try:
-                    await context.close()
-                    await browser.close()
-                except Exception:
-                    pass
     except Exception as e:
-        logging.error(f"Ошибка запуска playwright: {e}")
+        logging.error(f"Ошибка во время получения данных для user {user_id}: {e}")
         state["fetch_attempts"] = state.get("fetch_attempts", 0) + 1
     finally:
         state["is_fetching"] = False
@@ -279,26 +197,22 @@ async def search_and_enqueue_more(user_id: int):
 # ---------------- Отправка блока картинок ----------------
 async def send_block(user_id: int, call: CallbackQuery = None):
     """
-    Берёт из очереди BLOCK_SIZE картинок, отправляет их пользователю.
+    Отправляет блок изображений пользователю.
     """
     state = user_state.get(user_id)
     if not state:
         return
 
-    # Если в очереди мало картинок и не исчерпан лимит попыток — подгружаем
     if len(state["queue"]) < MIN_QUEUE_THRESHOLD and not state.get("is_fetching") and not state.get("fetch_exhausted"):
         asyncio.create_task(search_and_enqueue_more(user_id))
 
-    # Если очередь пустая — подождём
     if not state["queue"] and state.get("is_fetching"):
         waited = 0.0
         while waited < 5.0 and not state["queue"]:
             await asyncio.sleep(0.5)
             waited += 0.5
 
-    # Если очередь пустая и больше нечего грузить
     if not state["queue"]:
-        # Проверяем, было ли вообще что-то показано
         if len(state["shown"]) == 0:
             try:
                 msg = "❌ Не удалось найти картинки по этому запросу. Попробуй другой запрос."
@@ -307,9 +221,8 @@ async def send_block(user_id: int, call: CallbackQuery = None):
                 else:
                     await bot.send_message(user_id, msg)
             except Exception as e:
-                logging.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+                logging.error(f"Ошибка отправки сообщения: {e}")
         else:
-            # Если что-то уже показывалось — просто сообщаем что больше нет
             try:
                 msg = "📭 Больше новых картинок не найдено. Попробуй другой запрос!"
                 if call:
@@ -317,15 +230,13 @@ async def send_block(user_id: int, call: CallbackQuery = None):
                 else:
                     await bot.send_message(user_id, msg)
             except Exception as e:
-                logging.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+                logging.error(f"Ошибка отправки сообщения: {e}")
         return
 
-    # Формируем блок для отправки
     to_send = []
     while state["queue"] and len(to_send) < BLOCK_SIZE:
         to_send.append(state["queue"].pop(0))
 
-    # Отправляем картинки
     success_count = 0
     for img in to_send:
         try:
@@ -333,9 +244,13 @@ async def send_block(user_id: int, call: CallbackQuery = None):
             state["shown"].add(img)
             success_count += 1
         except Exception as e:
-            logging.error(f"Ошибка отправки фото {img} пользователю {user_id}: {e}")
+            logging.error(f"Ошибка отправки фото {img}: {e}")
+            # Пробуем отправить текстом
+            try:
+                await bot.send_message(user_id, f"🖼 {img}")
+            except Exception:
+                pass
 
-    # Отправляем кнопку "Показать ещё" только если есть шанс найти ещё
     if success_count > 0 and not state.get("fetch_exhausted"):
         try:
             keyboard = get_more_keyboard()
@@ -344,13 +259,14 @@ async def send_block(user_id: int, call: CallbackQuery = None):
             else:
                 await bot.send_message(user_id, "Хотите ещё?", reply_markup=keyboard)
         except Exception as e:
-            logging.error(f"Ошибка отправки кнопки пользователю {user_id}: {e}")
+            logging.error(f"Ошибка отправки кнопки: {e}")
 
 
-# ---------------- Обработчики команд и сообщений ----------------
+# ---------------- Обработчики команд ----------------
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("Привет! Введи запрос и я пришлю картинки из Pinterest в высоком разрешении. Нажимай «Показать ещё» чтобы подгружать следующие изображения.")
+    await message.answer("Привет! Введи запрос и я пришлю картинки из Pinterest в высоком разрешении.\n\n"
+                        "Нажимай «Показать ещё» чтобы подгружать следующие изображения.")
 
 
 @router.message()
@@ -358,7 +274,8 @@ async def handle_search(message: Message):
     query = message.text.strip()
     user_id = message.from_user.id
 
-    # Подготовим состояние пользователя
+    logging.info(f"User {user_id} ищет: {query}")
+
     st = user_state.setdefault(user_id, {
         "query": query,
         "queue": [],
@@ -366,25 +283,24 @@ async def handle_search(message: Message):
         "history": [],
         "is_fetching": False,
         "fetch_attempts": 0,
-        "fetch_exhausted": False
+        "fetch_exhausted": False,
+        "next_bookmark": None
     })
 
-    # Если новый запрос — обновляем query, очищаем всё
     if st["query"] != query:
         st["query"] = query
         st["queue"].clear()
         st["shown"].clear()
         st["fetch_attempts"] = 0
         st["fetch_exhausted"] = False
+        st["next_bookmark"] = None
 
     st["history"].append(query)
 
     await message.answer("Ищу изображения... 🔍")
 
-    # Заполнение очереди
     await search_and_enqueue_more(user_id)
 
-    # Если после fetch очередь пуста — сообщим
     if not st["queue"]:
         await message.answer("❌ Ничего не найдено. Попробуй другой запрос.")
         return
@@ -392,7 +308,6 @@ async def handle_search(message: Message):
     await send_block(user_id)
 
 
-# ---------------- Callback для кнопки "Показать ещё" ----------------
 @router.callback_query(lambda c: c.data == "more")
 async def more_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -407,7 +322,6 @@ async def more_callback(callback: CallbackQuery):
 
     state = user_state[user_id]
     
-    # Подгружаем если нужно и не исчерпано
     if len(state["queue"]) < MIN_QUEUE_THRESHOLD and not state.get("is_fetching") and not state.get("fetch_exhausted"):
         asyncio.create_task(search_and_enqueue_more(user_id))
 
@@ -416,7 +330,7 @@ async def more_callback(callback: CallbackQuery):
 
 # ---------------- Запуск бота ----------------
 async def main():
-    print("Бот запущен!")
+    logging.info("Бот запущен!")
     await dp.start_polling(bot)
 
 
@@ -424,4 +338,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("Остановка бота")
+        logging.info("Остановка бота")
