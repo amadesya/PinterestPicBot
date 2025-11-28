@@ -48,96 +48,176 @@ def get_more_keyboard():
 # ---------------- Парсер Pinterest через API ----------------
 async def fetch_images_from_pinterest_api(query: str, already_seen: Set[str], bookmark: str = None) -> tuple[List[str], str]:
     """
-    Использует внутреннее API Pinterest для получения изображений.
+    Использует поиск через обычную HTML страницу Pinterest.
     Возвращает (список URL, bookmark для следующей страницы)
     """
     try:
-        # Pinterest использует GraphQL API
-        url = "https://www.pinterest.com/resource/BaseSearchResource/get/"
-        
-        # Параметры запроса
-        options = {
-            "query": query,
-            "scope": "pins",
-            "page_size": 25
-        }
-        
-        if bookmark:
-            options["bookmarks"] = [bookmark]
-        
-        params = {
-            "source_url": f"/search/pins/?q={query}",
-            "data": json.dumps({
-                "options": options,
-                "context": {}
-            })
-        }
+        # Используем обычный поиск через веб-страницу
+        search_url = f"https://www.pinterest.com/search/pins/?q={query.replace(' ', '%20')}"
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "X-Requested-With": "XMLHttpRequest"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Cache-Control": "max-age=0"
         }
         
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, timeout=30) as response:
+            async with session.get(search_url, headers=headers, timeout=30, allow_redirects=True) as response:
                 if response.status != 200:
-                    logging.error(f"Pinterest API вернул статус {response.status}")
+                    logging.error(f"Pinterest вернул статус {response.status}")
+                    text = await response.text()
+                    logging.error(f"Ответ: {text[:500]}")
                     return [], None
                 
-                data = await response.json()
+                html = await response.text()
+                logging.info(f"Получена HTML страница, длина: {len(html)}")
                 
-                # Извлекаем результаты
-                results = []
-                next_bookmark = None
+                # Ищем JSON данные в HTML (Pinterest встраивает данные в скрипты)
+                import re
                 
-                if "resource_response" in data:
-                    resource = data["resource_response"]
+                # Pinterest хранит данные в window.__PWS_DATA__
+                pattern = r'<script[^>]*>window\.__PWS_DATA__\s*=\s*(\{.*?\});</script>'
+                match = re.search(pattern, html, re.DOTALL)
+                
+                if not match:
+                    # Пробуем другой паттерн
+                    pattern = r'"props":\s*(\{.*?"initialReduxState".*?\})'
+                    matches = re.finditer(pattern, html, re.DOTALL)
+                    for m in matches:
+                        try:
+                            data = json.loads(m.group(1))
+                            if "initialReduxState" in data:
+                                match = m
+                                break
+                        except:
+                            continue
+                
+                if not match:
+                    logging.error("Не удалось найти данные в HTML")
+                    # Пробуем парсить img теги напрямую
+                    return await parse_html_images(html, already_seen), None
+                
+                # Парсим JSON
+                try:
+                    json_str = match.group(1)
+                    data = json.loads(json_str)
+                    json_str = match.group(1)
+                    data = json.loads(json_str)
                     
-                    # Получаем bookmark для следующей страницы
-                    if "bookmark" in resource.get("data", {}):
-                        next_bookmark = resource["data"]["bookmark"]
+                    results = []
                     
-                    # Извлекаем пины
-                    pins = resource.get("data", {}).get("results", [])
+                    # Ищем пины в разных местах структуры
+                    pins = []
+                    if "props" in data and "initialReduxState" in data["props"]:
+                        redux = data["props"]["initialReduxState"]
+                        if "pins" in redux:
+                            pins = list(redux["pins"].values())
                     
-                    logging.info(f"Получено {len(pins)} пинов от API")
+                    logging.info(f"Найдено {len(pins)} пинов в JSON")
                     
                     for pin in pins:
                         try:
-                            # Получаем изображение в максимальном качестве
-                            images = pin.get("images", {})
-                            
-                            # Приоритет: orig > originals > 736x > 474x
-                            img_url = None
-                            if "orig" in images:
-                                img_url = images["orig"].get("url")
-                            elif "originals" in images:
-                                img_url = images["originals"].get("url")
-                            elif "736x" in images:
-                                img_url = images["736x"].get("url")
-                            elif "474x" in images:
-                                img_url = images["474x"].get("url")
-                            
-                            if img_url and img_url not in already_seen:
-                                results.append(img_url)
-                                already_seen.add(img_url)
-                                logging.info(f"✓ Добавлено: {img_url[:80]}")
-                        
+                            if isinstance(pin, dict) and "images" in pin:
+                                images = pin["images"]
+                                
+                                img_url = None
+                                if "orig" in images:
+                                    img_url = images["orig"].get("url")
+                                elif "originals" in images:  
+                                    img_url = images["originals"].get("url")
+                                elif "736x" in images:
+                                    img_url = images["736x"].get("url")
+                                elif "474x" in images:
+                                    img_url = images["474x"].get("url")
+                                
+                                if img_url and img_url not in already_seen:
+                                    results.append(img_url)
+                                    already_seen.add(img_url)
+                                    logging.info(f"✓ Добавлено: {img_url[:80]}")
                         except Exception as e:
                             logging.error(f"Ошибка обработки пина: {e}")
                             continue
-                
-                return results, next_bookmark
+                    
+                    if results:
+                        return results, None
+                    else:
+                        # Если JSON не дал результатов, парсим HTML
+                        return await parse_html_images(html, already_seen), None
+                        
+                except json.JSONDecodeError as e:
+                    logging.error(f"Ошибка парсинга JSON: {e}")
+                    return await parse_html_images(html, already_seen), None
                 
     except asyncio.TimeoutError:
-        logging.error("Таймаут запроса к Pinterest API")
+        logging.error("Таймаут запроса к Pinterest")
         return [], None
     except Exception as e:
-        logging.error(f"Ошибка при запросе к Pinterest API: {e}")
+        logging.error(f"Ошибка при запросе к Pinterest: {e}")
         import traceback
         logging.error(traceback.format_exc())
         return [], None
+
+
+async def parse_html_images(html: str, already_seen: Set[str]) -> List[str]:
+    """
+    Парсит img теги из HTML напрямую как запасной вариант.
+    """
+    import re
+    results = []
+    
+    # Ищем все img теги с pinimg.com
+    img_pattern = r'<img[^>]+src="([^"]*pinimg\.com[^"]*)"'
+    matches = re.finditer(img_pattern, html)
+    
+    for match in matches:
+        url = match.group(1)
+        
+        # Фильтруем превью
+        if any(x in url for x in ['60x60', '75x75', '236x', 'avatar', 'profile']):
+            continue
+        
+        # Преобразуем в оригинал
+        if '/474x/' in url:
+            url = url.replace('/474x/', '/originals/')
+        elif '/736x/' in url:
+            url = url.replace('/736x/', '/originals/')
+        
+        if url not in already_seen and url.startswith('http'):
+            results.append(url)
+            already_seen.add(url)
+            logging.info(f"✓ Из HTML: {url[:80]}")
+    
+    # Также ищем в srcset
+    srcset_pattern = r'srcset="([^"]*pinimg\.com[^"]*)"'
+    matches = re.finditer(srcset_pattern, html)
+    
+    for match in matches:
+        srcset = match.group(1)
+        urls = re.findall(r'(https://[^\s,]+)', srcset)
+        
+        for url in urls:
+            if any(x in url for x in ['60x60', '75x75', '236x', 'avatar', 'profile']):
+                continue
+            
+            if '/474x/' in url:
+                url = url.replace('/474x/', '/originals/')
+            elif '/736x/' in url:
+                url = url.replace('/736x/', '/originals/')
+            
+            if url not in already_seen and url.startswith('http'):
+                results.append(url)
+                already_seen.add(url)
+                logging.info(f"✓ Из srcset: {url[:80]}")
+    
+    logging.info(f"Всего извлечено из HTML: {len(results)}")
+    return results
 
 
 async def search_and_enqueue_more(user_id: int):
