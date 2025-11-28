@@ -17,26 +17,22 @@ async def search_pinterest(query: str, limit: int = 5):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-        
+
         await page.goto(
             f"https://www.pinterest.com/search/pins/?q={query.replace(' ', '%20')}",
             timeout=60000
         )
 
-        await page.wait_for_load_state("networkidle")
+        await page.wait_for_selector("img[srcset]", timeout=20000)
 
-        await page.wait_for_selector("img[srcset]", state="attached", timeout=20000)
-
-        elements = await page.query_selector_all("img[srcset]")
-        images = []
-
-        for el in elements[:limit]:
-            src = await el.get_attribute("src")
-            if src:
-                images.append(src)
+        srcsets = await page.eval_on_selector_all(
+            "img[srcset]",
+            "imgs => imgs.map(img => img.srcset.split(', ').map(s => s.split(' ')[0]).pop())"
+        )
 
         await browser.close()
-        return images
+        return srcsets[:limit]
+
 
 @router.message(Command("start"))
 async def start_cmd(message: Message):
