@@ -1,6 +1,6 @@
 ## ЗАПУСК 
 
-1. Установка библиотека
+1. Установка библиотек
 ```
 pip install aiogram playwright beautifulsoup4 aiohttp && playwright install
 
