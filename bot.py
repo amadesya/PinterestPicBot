@@ -26,19 +26,13 @@ router = Router()
 dp.include_router(router)
 
 # ---------------- Состояние (в памяти) ----------------
-# user_state[user_id] = {
-#   "query": str,
-#   "queue": List[str],         # подготовленные ссылки к отправке
-#   "shown": Set[str],          # ссылки уже показанные (чтобы не повторять)
-#   "history": List[str],       # история запросов
-#   "is_fetching": bool         # флаг чтобы не запускать параллельные парсеры
-# }
 user_state = {}
 
 # Параметры работы
 BLOCK_SIZE = 5           # сколько картинок отправляем за раз
-SCRROLLS_PER_FETCH = 4   # сколько раз скроллить при каждом доп.запросе
+SCRROLLS_PER_FETCH = 5   # сколько раз скроллить при каждом доп.запросе
 MIN_QUEUE_THRESHOLD = 8  # когда в очереди меньше этого числа — подгружать ещё
+MAX_FETCH_ATTEMPTS = 3   # максимум попыток fetch до остановки
 
 
 # ---------------- Вспомогательные клавиатуры ----------------
@@ -48,49 +42,74 @@ def get_more_keyboard():
     )
 
 
+def extract_highest_resolution_url(srcset: str) -> str:
+    """
+    Извлекает URL с максимальным разрешением из srcset.
+    srcset формат: "url1 100w, url2 200w, url3 500w"
+    """
+    try:
+        parts = [p.strip() for p in srcset.split(',') if p.strip()]
+        # Каждая часть: "url width"
+        max_width = 0
+        best_url = None
+        
+        for part in parts:
+            tokens = part.split()
+            if len(tokens) >= 2:
+                url = tokens[0]
+                width_str = tokens[1].rstrip('w')
+                try:
+                    width = int(width_str)
+                    if width > max_width:
+                        max_width = width
+                        best_url = url
+                except ValueError:
+                    continue
+        
+        return best_url if best_url else parts[-1].split()[0]
+    except Exception:
+        return None
+
+
 # ---------------- Парсер Pinterest ----------------
 async def fetch_images_from_pinterest(query: str, page: Page, already_seen: Set[str]) -> List[str]:
     """
     Парсит страницу Pinterest с данным query в контексте уже открытой страницы.
-    Скроллит несколько раз, собирает ссылки картинок и возвращает новые (не из already_seen).
+    Скроллит несколько раз, собирает ссылки картинок в максимальном разрешении.
     """
     try:
-        # Убедимся, что мы на правильной странице
         await page.goto(f"https://www.pinterest.com/search/pins/?q={query.replace(' ', '%20')}", timeout=60000)
         await page.wait_for_selector("img[srcset]", timeout=20000)
     except Exception as e:
         logging.error(f"Ошибка при заходе на страницу Pinterest: {e}")
-        # продолжим — возможно некоторые данные всё же есть
-    # Скроллим страницу, чтобы подгрузились новые картинки
+    
+    # Скроллим страницу для подгрузки новых картинок
     for _ in range(SCRROLLS_PER_FETCH):
         try:
             await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.5)
         except Exception as e:
             logging.error(f"Ошибка при скролле Pinterest: {e}")
 
-    # Получаем все подходящие img элементы и извлекаем src/srcset
+    # Получаем все img элементы и извлекаем URL в максимальном разрешении
     try:
-        imgs = await page.query_selector_all("img[srcset], img[src]")
+        imgs = await page.query_selector_all("img[srcset]")
         results = []
+        
         for el in imgs:
-            src = None
             try:
-                src = await el.get_attribute("src")
-                if not src:
-                    # Если нет src — пробуем взять srcset и вытянуть первую ссылку
-                    srcset = await el.get_attribute("srcset")
-                    if srcset:
-                        # srcset -> "url1 100w, url2 200w" -> взять первый url (или последний)
-                        parts = [p.strip().split(' ')[0] for p in srcset.split(',') if p.strip()]
-                        if parts:
-                            src = parts[-1]  # беру последний т.к. он часто больше
-                if src and src not in already_seen:
-                    results.append(src)
-                    already_seen.add(src)
+                # Приоритет: srcset с максимальным разрешением
+                srcset = await el.get_attribute("srcset")
+                if srcset:
+                    url = extract_highest_resolution_url(srcset)
+                    if url and url not in already_seen and url.startswith('http'):
+                        # Фильтруем очевидные превью и иконки
+                        if '60x60' not in url and '75x75' not in url and '236x' not in url:
+                            results.append(url)
+                            already_seen.add(url)
             except Exception:
-                # отдельный элемент мог упасть — пропускаем
                 continue
+        
         return results
     except Exception as e:
         logging.error(f"Ошибка при извлечении изображений: {e}")
@@ -100,7 +119,6 @@ async def fetch_images_from_pinterest(query: str, page: Page, already_seen: Set[
 async def search_and_enqueue_more(user_id: int):
     """
     Открывает браузер, парсит Pinterest и добавляет новые ссылки в очередь пользователя.
-    Защищено флагом is_fetching для предотвращения параллельных fetch'ей.
     """
     state = user_state.get(user_id)
     if not state:
@@ -110,32 +128,40 @@ async def search_and_enqueue_more(user_id: int):
     if state.get("is_fetching"):
         return
 
+    # Проверяем количество неудачных попыток
+    if state.get("fetch_attempts", 0) >= MAX_FETCH_ATTEMPTS:
+        state["fetch_exhausted"] = True
+        return
+
     state["is_fetching"] = True
     query = state["query"]
+    
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             try:
                 new_imgs = await fetch_images_from_pinterest(query, page, state["shown"])
-                # добавляем только уникальные и не показанные (fetch_images_from_pinterest уже исключил shown)
-                # но нужно следить, чтобы не добавлять то, что уже в очереди
+                
                 queued_set = set(state["queue"])
                 appended = 0
+                
                 for img in new_imgs:
                     if img not in queued_set:
                         state["queue"].append(img)
                         queued_set.add(img)
                         appended += 1
+                
+                # Если ничего не добавилось — увеличиваем счётчик неудач
                 if appended == 0:
-                    # попробуем ещё один проход с большим скроллом (редкая ситуация)
-                    extra_imgs = await fetch_images_from_pinterest(query, page, state["shown"])
-                    for img in extra_imgs:
-                        if img not in queued_set:
-                            state["queue"].append(img)
-                            queued_set.add(img)
+                    state["fetch_attempts"] = state.get("fetch_attempts", 0) + 1
+                else:
+                    # Сбрасываем счётчик при успехе
+                    state["fetch_attempts"] = 0
+                    
             except Exception as e:
                 logging.error(f"Ошибка во время парсинга для user {user_id}: {e}")
+                state["fetch_attempts"] = state.get("fetch_attempts", 0) + 1
             finally:
                 try:
                     await browser.close()
@@ -143,6 +169,7 @@ async def search_and_enqueue_more(user_id: int):
                     pass
     except Exception as e:
         logging.error(f"Ошибка запуска playwright: {e}")
+        state["fetch_attempts"] = state.get("fetch_attempts", 0) + 1
     finally:
         state["is_fetching"] = False
 
@@ -150,70 +177,78 @@ async def search_and_enqueue_more(user_id: int):
 # ---------------- Отправка блока картинок ----------------
 async def send_block(user_id: int, call: CallbackQuery = None):
     """
-    Берёт из очереди BLOCK_SIZE картинок, отправляет их пользователю и добавляет кнопку 'Показать ещё'.
-    Если очередь мала — запускает фоновой fetch, ждёт его (до короткого таймаута) и потом отправляет то, что есть.
+    Берёт из очереди BLOCK_SIZE картинок, отправляет их пользователю.
     """
     state = user_state.get(user_id)
     if not state:
         return
 
-    # Если в очереди мало картинок, инициируем подгрузку
-    if len(state["queue"]) < MIN_QUEUE_THRESHOLD and not state.get("is_fetching"):
-        # запускаем fetch без блокировки — он сам ставит is_fetching
+    # Если в очереди мало картинок и не исчерпан лимит попыток — подгружаем
+    if len(state["queue"]) < MIN_QUEUE_THRESHOLD and not state.get("is_fetching") and not state.get("fetch_exhausted"):
         asyncio.create_task(search_and_enqueue_more(user_id))
 
-    # Если очередь пустая — подождём короткое время, чтобы парсер успел что-то положить
+    # Если очередь пустая — подождём
     if not state["queue"] and state.get("is_fetching"):
-        # подождём до 4 секунд, проверяя очередь каждые 0.5s
         waited = 0.0
-        while waited < 4.0 and not state["queue"]:
+        while waited < 5.0 and not state["queue"]:
             await asyncio.sleep(0.5)
             waited += 0.5
 
-    # Если всё ещё ничего — уведомляем пользователя
+    # Если очередь пустая и больше нечего грузить
     if not state["queue"]:
-        try:
-            if call:
-                await call.message.answer("❌ Не удалось найти новые картинки прямо сейчас. Попробуй позже.")
-            else:
-                await bot.send_message(user_id, "❌ Не удалось найти новые картинки прямо сейчас. Попробуй позже.")
-        except Exception as e:
-            logging.error(f"Ошибка отправки сообщения о пустой очереди пользователю {user_id}: {e}")
+        # Проверяем, было ли вообще что-то показано
+        if len(state["shown"]) == 0:
+            try:
+                msg = "❌ Не удалось найти картинки по этому запросу. Попробуй другой запрос."
+                if call:
+                    await call.message.answer(msg)
+                else:
+                    await bot.send_message(user_id, msg)
+            except Exception as e:
+                logging.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+        else:
+            # Если что-то уже показывалось — просто сообщаем что больше нет
+            try:
+                msg = "📭 Больше новых картинок не найдено. Попробуй другой запрос!"
+                if call:
+                    await call.message.answer(msg)
+                else:
+                    await bot.send_message(user_id, msg)
+            except Exception as e:
+                logging.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
         return
 
-    # формируем блок для отправки
+    # Формируем блок для отправки
     to_send = []
     while state["queue"] and len(to_send) < BLOCK_SIZE:
         to_send.append(state["queue"].pop(0))
 
-    # отправляем картинки
+    # Отправляем картинки
+    success_count = 0
     for img in to_send:
         try:
-            await bot.send_photo(user_id, img, caption=f"🔗 {img}")
+            await bot.send_photo(user_id, img)
             state["shown"].add(img)
+            success_count += 1
         except Exception as e:
             logging.error(f"Ошибка отправки фото {img} пользователю {user_id}: {e}")
-            try:
-                await bot.send_message(user_id, f"❌ Не удалось загрузить картинку:\n{img}")
-            except Exception as e2:
-                logging.error(f"Ошибка отправки fallback-сообщения: {e2}")
 
-    # Отправляем кнопку "Показать ещё" прямо после блока
-    try:
-        keyboard = get_more_keyboard()
-        if call:
-            # пытаемся отредактировать callback message, но удобнее просто отправить новое сообщение с кнопкой
-            await call.message.answer("Хотите ещё?", reply_markup=keyboard)
-        else:
-            await bot.send_message(user_id, "Хотите ещё?", reply_markup=keyboard)
-    except Exception as e:
-        logging.error(f"Ошибка отправки кнопки пользователю {user_id}: {e}")
+    # Отправляем кнопку "Показать ещё" только если есть шанс найти ещё
+    if success_count > 0 and not state.get("fetch_exhausted"):
+        try:
+            keyboard = get_more_keyboard()
+            if call:
+                await call.message.answer("Хотите ещё?", reply_markup=keyboard)
+            else:
+                await bot.send_message(user_id, "Хотите ещё?", reply_markup=keyboard)
+        except Exception as e:
+            logging.error(f"Ошибка отправки кнопки пользователю {user_id}: {e}")
 
 
 # ---------------- Обработчики команд и сообщений ----------------
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("Привет! Введи запрос и я пришлю картинки из Pinterest. Нажимай «Показать ещё» чтобы подгружать следующие изображения.")
+    await message.answer("Привет! Введи запрос и я пришлю картинки из Pinterest в высоком разрешении. Нажимай «Показать ещё» чтобы подгружать следующие изображения.")
 
 
 @router.message()
@@ -227,24 +262,27 @@ async def handle_search(message: Message):
         "queue": [],
         "shown": set(),
         "history": [],
-        "is_fetching": False
+        "is_fetching": False,
+        "fetch_attempts": 0,
+        "fetch_exhausted": False
     })
 
-    # Если новый запрос — обновляем query, очищаем queue и shown (чтобы начать свежо)
+    # Если новый запрос — обновляем query, очищаем всё
     if st["query"] != query:
         st["query"] = query
         st["queue"].clear()
         st["shown"].clear()
+        st["fetch_attempts"] = 0
+        st["fetch_exhausted"] = False
 
     st["history"].append(query)
 
     await message.answer("Ищу изображения... 🔍")
 
-    # Сразу заполнение очереди (синхронно, чтобы пользователь получил первый блок)
-    # будем вызывать fetch, который обновит st["queue"]
+    # Заполнение очереди
     await search_and_enqueue_more(user_id)
 
-    # Если после fetch очередь пуста — сообщим, иначе отправим первый блок
+    # Если после fetch очередь пуста — сообщим
     if not st["queue"]:
         await message.answer("❌ Ничего не найдено. Попробуй другой запрос.")
         return
@@ -256,8 +294,8 @@ async def handle_search(message: Message):
 @router.callback_query(lambda c: c.data == "more")
 async def more_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
-    await callback.answer()  # убираем "часики" в интерфейсе
-    # Если пользователь ещё не запрашивал — игнор
+    await callback.answer()
+    
     if user_id not in user_state:
         try:
             await callback.message.answer("Отправь сначала запрос текстом.")
@@ -265,9 +303,10 @@ async def more_callback(callback: CallbackQuery):
             pass
         return
 
-    # если в очереди мало — инициируем подгрузку
     state = user_state[user_id]
-    if len(state["queue"]) < MIN_QUEUE_THRESHOLD and not state.get("is_fetching"):
+    
+    # Подгружаем если нужно и не исчерпано
+    if len(state["queue"]) < MIN_QUEUE_THRESHOLD and not state.get("is_fetching") and not state.get("fetch_exhausted"):
         asyncio.create_task(search_and_enqueue_more(user_id))
 
     await send_block(user_id, call=callback)
