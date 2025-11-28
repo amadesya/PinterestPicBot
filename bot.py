@@ -15,7 +15,7 @@ user_queries = {}
 
 async def search_pinterest(query: str):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(executable_path="/usr/bin/chromium-browser", headless=True)
+        browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         await page.goto(f"https://www.pinterest.com/search/pins/?q={query.replace(' ', '%20')}")
         await page.wait_for_selector("img[srcset]", timeout=10000)
